@@ -246,7 +246,7 @@ async fn discover_streamable_http_oauth_with_headers_and_http_client(
     let mut authorization_manager =
         AuthorizationManager::new_with_oauth_http_client(url, Arc::new(oauth_http_client)).await?;
     authorization_manager.set_allow_missing_issuer(true);
-    discover_streamable_http_oauth_with_manager(&authorization_manager).await
+    discover_streamable_http_oauth_with_manager(&mut authorization_manager).await
 }
 
 fn has_configured_headers(
@@ -262,16 +262,37 @@ fn has_configured_headers(
 }
 
 async fn discover_streamable_http_oauth_with_manager(
-    authorization_manager: &AuthorizationManager,
+    authorization_manager: &mut AuthorizationManager,
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
     match authorization_manager.resolve_metadata().boxed().await {
         Ok(resolution) if !resolution.source.is_discovered() => Ok(None),
         Ok(resolution) => {
             let metadata = resolution.metadata;
+            let supports_offline_access = metadata
+                .scopes_supported
+                .as_ref()
+                .is_some_and(|scopes| scopes.iter().any(|scope| scope == "offline_access"));
+            let callback_mode =
+                callback_mode(&metadata).unwrap_or(McpOAuthCallbackMode::CallbackSpecific);
+
+            // RMCP's general selector falls back to the authorization server's
+            // global scopes_supported when no resource scopes are available.
+            // MCP scope selection instead uses the initial challenge, then the
+            // protected resource metadata, and otherwise omits scope.
+            let mut selection_metadata = metadata;
+            selection_metadata.scopes_supported = None;
+            authorization_manager.set_metadata(selection_metadata);
+            let mut scopes = authorization_manager.select_scopes(None, &[]);
+            if supports_offline_access
+                && !scopes.is_empty()
+                && !scopes.iter().any(|scope| scope == "offline_access")
+            {
+                scopes.push("offline_access".to_string());
+            }
+
             Ok(Some(StreamableHttpOAuthDiscovery {
-                callback_mode: callback_mode(&metadata)
-                    .unwrap_or(McpOAuthCallbackMode::CallbackSpecific),
-                scopes_supported: normalize_scopes(metadata.scopes_supported),
+                callback_mode,
+                scopes_supported: normalize_scopes(Some(scopes)),
             }))
         }
         Err(AuthError::NoAuthorizationSupport) => Ok(None),
@@ -677,7 +698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_streamable_http_oauth_returns_normalized_scopes() {
+    async fn discover_streamable_http_oauth_omits_authorization_server_scopes() {
         let server = spawn_oauth_discovery_server(serde_json::json!({
             "authorization_endpoint": "https://example.com/authorize",
             "token_endpoint": "https://example.com/token",
@@ -701,7 +722,7 @@ mod tests {
         assert_eq!(
             discovery,
             StreamableHttpOAuthDiscovery {
-                scopes_supported: Some(vec!["profile".to_string(), "email".to_string()]),
+                scopes_supported: None,
                 callback_mode: McpOAuthCallbackMode::IssuerBound,
             }
         );
@@ -834,7 +855,7 @@ mod tests {
         let authorization_server = spawn_oauth_discovery_server(serde_json::json!({
             "authorization_endpoint": "https://example.com/authorize",
             "token_endpoint": "https://example.com/token",
-            "scopes_supported": ["read", " write ", "read"],
+            "scopes_supported": ["authorization-server-only", "offline_access"],
         }))
         .await;
 
@@ -861,6 +882,7 @@ mod tests {
                         Json(serde_json::json!({
                             "resource": format!("http://{address}/mcp"),
                             "authorization_servers": [authorization_server_url],
+                            "scopes_supported": ["resource:read", "resource:write"],
                         }))
                     }
                 }),
@@ -887,7 +909,11 @@ mod tests {
 
         assert_eq!(
             discovery.scopes_supported,
-            Some(vec!["read".to_string(), "write".to_string()])
+            Some(vec![
+                "resource:read".to_string(),
+                "resource:write".to_string(),
+                "offline_access".to_string(),
+            ])
         );
     }
 
